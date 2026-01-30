@@ -30,60 +30,144 @@ let undiciRequest: typeof import("undici").request | undefined;
 /**
  * @internal
  *
+ * Lightweight shim for response headers that avoids creating a Headers object.
+ * Only implements the get() method which is all that _runQueue needs.
+ */
+class UndiciHeadersShim implements Headers {
+  private _headers: Record<string, string | string[] | undefined>;
+
+  constructor(headers: Record<string, string | string[] | undefined>) {
+    this._headers = headers;
+  }
+
+  get(name: string): string | null {
+    const value = this._headers[name.toLowerCase()];
+    if (value === undefined) return null;
+    return Array.isArray(value) ? value[0] : value;
+  }
+
+  // Stub implementations for Headers interface - not used by arangojs
+  append(_name: string, _value: string): void {
+    throw new Error("Not implemented");
+  }
+  delete(_name: string): void {
+    throw new Error("Not implemented");
+  }
+  entries(): IterableIterator<[string, string]> {
+    throw new Error("Not implemented");
+  }
+  forEach(
+    _callbackfn: (value: string, key: string, parent: Headers) => void
+  ): void {
+    throw new Error("Not implemented");
+  }
+  has(_name: string): boolean {
+    throw new Error("Not implemented");
+  }
+  keys(): IterableIterator<string> {
+    throw new Error("Not implemented");
+  }
+  set(_name: string, _value: string): void {
+    throw new Error("Not implemented");
+  }
+  values(): IterableIterator<string> {
+    throw new Error("Not implemented");
+  }
+  getSetCookie(): string[] {
+    throw new Error("Not implemented");
+  }
+  [Symbol.iterator](): IterableIterator<[string, string]> {
+    throw new Error("Not implemented");
+  }
+}
+
+/**
+ * @internal
+ *
+ * Lightweight Response-like shim for undici.request results.
+ * Implements the Response interface but only the methods actually used by arangojs.
+ */
+class UndiciResponseShim implements globalThis.Response {
+  readonly status: number;
+  readonly ok: boolean;
+  readonly headers: Headers;
+  readonly body: ReadableStream<Uint8Array> | null;
+  readonly url: string;
+  readonly request: globalThis.Request;
+  readonly arangojsHostUrl: string;
+  parsedBody?: unknown;
+
+  // Required by Response interface but not used by arangojs
+  readonly bodyUsed = false;
+  readonly redirected = false;
+  readonly statusText = "";
+  readonly type: Response["type"] = "default";
+
+  private _body: import("undici").Dispatcher.ResponseData["body"];
+
+  constructor(
+    statusCode: number,
+    headers: Record<string, string | string[] | undefined>,
+    body: import("undici").Dispatcher.ResponseData["body"],
+    request: globalThis.Request,
+    arangojsHostUrl: string
+  ) {
+    this.status = statusCode;
+    this.ok = statusCode >= 200 && statusCode < 300;
+    this.headers = new UndiciHeadersShim(headers);
+    this._body = body;
+    this.body = body as unknown as ReadableStream<Uint8Array> | null;
+    this.url = request.url;
+    this.request = request;
+    this.arangojsHostUrl = arangojsHostUrl;
+  }
+
+  json(): Promise<unknown> {
+    return this._body.json();
+  }
+
+  text(): Promise<string> {
+    return this._body.text();
+  }
+
+  blob(): Promise<Blob> {
+    return this._body.blob();
+  }
+
+  clone(): Response {
+    // Safe: only called before body consumption in error handling
+    return this;
+  }
+
+  // Stub implementations - not used by arangojs
+  arrayBuffer(): Promise<ArrayBuffer> {
+    return this._body.arrayBuffer();
+  }
+
+  bytes(): Promise<Uint8Array> {
+    return this._body.bytes();
+  }
+
+  formData(): Promise<FormData> {
+    throw new Error("formData() not supported");
+  }
+}
+
+/**
+ * @internal
+ *
  * Creates a Response-like object from undici.request result.
  * This shim implements only the properties/methods used by arangojs.
+ * Optimized to avoid Headers object construction.
  */
 function createUndiciResponse(
   statusCode: number,
   headers: Record<string, string | string[] | undefined>,
   body: import("undici").Dispatcher.ResponseData["body"],
   request: globalThis.Request,
-  arangojsHostUrl: string,
-): globalThis.Response & {
-  request: globalThis.Request;
-  arangojsHostUrl: string;
-} {
-  // Normalize headers to Headers object
-  const normalizedHeaders = new Headers();
-  for (const [key, value] of Object.entries(headers)) {
-    if (value === undefined) continue;
-    if (Array.isArray(value)) {
-      for (const v of value) normalizedHeaders.append(key, v);
-    } else {
-      normalizedHeaders.set(key, value);
-    }
-  }
-
-  return {
-    status: statusCode,
-    statusText:
-      STATUS_CODE_DEFAULT_MESSAGES[
-        statusCode as keyof typeof STATUS_CODE_DEFAULT_MESSAGES
-      ] || "",
-    headers: normalizedHeaders,
-    body: body as any,
-    bodyUsed: false,
-    ok: statusCode >= 200 && statusCode < 300,
-    redirected: false,
-    type: "default",
-    url: request.url,
-    // Body consumption methods (undici body has same interface)
-    json: () => body.json(),
-    text: () => body.text(),
-    blob: () => body.blob(),
-    arrayBuffer: () => body.arrayBuffer(),
-    bytes: () => body.bytes(),
-    formData: () => {
-      throw new Error("formData() not supported");
-    },
-    // clone() for error body parsing (line 837)
-    clone() {
-      return this;
-    }, // Safe: only called before body consumption
-    // Metadata
-    request,
-    arangojsHostUrl,
-  } as any;
+  arangojsHostUrl: string
+): UndiciResponseShim {
+  return new UndiciResponseShim(statusCode, headers, body, request, arangojsHostUrl);
 }
 
 //#region Host
@@ -109,7 +193,9 @@ type Host = {
       | "expectBinary"
       | "isBinary"
     >
-  ) => Promise<globalThis.Response & { request: globalThis.Request }>;
+  ) => Promise<
+    (globalThis.Response | UndiciResponseShim) & { request: globalThis.Request }
+  >;
   /**
    * @internal
    *
@@ -129,7 +215,7 @@ type Host = {
 function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
   const baseUrl = new URL(arangojsHostUrl);
   let fetch = globalThis.fetch;
-  let createDispatcher: (() => Promise<any>) | undefined;
+  let dispatcherPromise: Promise<any> | undefined;
   let dispatcher: any;
   let socketPath: string | undefined;
   if (arangojsHostUrl.match(/^\w+:\/\/unix:\//)) {
@@ -144,9 +230,16 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       },
     };
   }
+
+  // Cache static values to avoid per-request computation
+  const baseUrlString = baseUrl.origin + baseUrl.pathname;
+  const baseUrlSearch = baseUrl.search;
+  const authHeader = `Basic ${btoa(`${baseUrl.username || "root"}:${baseUrl.password || ""}`)}`;
+
   let Request = globalThis.Request;
   if (agentOptions) {
-    createDispatcher = async () => {
+    // Eagerly start dispatcher initialization to avoid async overhead on first request
+    dispatcherPromise = (async () => {
       let undici: any;
       try {
         // Prevent overzealous bundlers from attempting to bundle undici
@@ -166,7 +259,7 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       Request = undici.Request;
       undiciRequest = undici.request;
       return new undici.Agent(agentOptions);
-    };
+    })();
   }
   const pending = new Map<string, AbortController>();
   return {
@@ -189,8 +282,18 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       | "expectBinary"
       | "isBinary"
     >) {
-      const url = new URL(pathname + baseUrl.search, baseUrl);
+      // Wait for dispatcher if initialization is in progress
+      if (dispatcherPromise) {
+        dispatcher = await dispatcherPromise;
+        dispatcherPromise = undefined;
+      }
+
+      // Optimize URL construction - avoid URL object when possible
+      let requestUrl: string;
+      let url: URL | undefined;
       if (search) {
+        // Need URL object for search params
+        url = new URL(pathname + baseUrlSearch, baseUrl);
         const searchParams =
           search instanceof URLSearchParams
             ? search
@@ -198,30 +301,68 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
         for (const [key, value] of searchParams) {
           url.searchParams.append(key, value);
         }
+        requestUrl = url.toString();
+      } else {
+        // Fast path - simple string concatenation
+        requestUrl = baseUrlString + pathname + baseUrlSearch;
       }
-      const headers = new Headers(requestHeaders);
-      if (!headers.has("authorization")) {
-        headers.set(
-          "authorization",
-          `Basic ${btoa(
-            `${baseUrl.username || "root"}:${baseUrl.password || ""}`
-          )}`
-        );
-      }
+
       const abortController = new AbortController();
       const signal = abortController.signal;
-      if (createDispatcher) {
-        dispatcher = await createDispatcher();
-        createDispatcher = undefined;
+
+      // For undici path, build headers directly as plain object
+      let headerObj: Record<string, string> | undefined;
+      let headers: Headers | undefined;
+
+      if (undiciRequest) {
+        // Build headers as plain object directly, skip Headers construction
+        headerObj = {};
+
+        // Add cached auth header (unless requestHeaders overrides it)
+        let hasAuth = false;
+        if (requestHeaders) {
+          if (requestHeaders instanceof Headers) {
+            for (const [k, v] of requestHeaders) {
+              headerObj[k] = v;
+              if (k.toLowerCase() === "authorization") hasAuth = true;
+            }
+          } else if (Array.isArray(requestHeaders)) {
+            for (const [k, v] of requestHeaders) {
+              headerObj[k] = v;
+              if (k.toLowerCase() === "authorization") hasAuth = true;
+            }
+          } else {
+            for (const [k, v] of Object.entries(requestHeaders)) {
+              if (Array.isArray(v)) {
+                headerObj[k] = v.join(", ");
+              } else {
+                headerObj[k] = String(v);
+              }
+              if (k.toLowerCase() === "authorization") hasAuth = true;
+            }
+          }
+        }
+        if (!hasAuth) {
+          headerObj["authorization"] = authHeader;
+        }
+      } else {
+        // Browser/Deno fetch path - use Headers as before
+        headers = new Headers(requestHeaders);
+        if (!headers.has("authorization")) {
+          headers.set("authorization", authHeader);
+        }
       }
-      const request = new Request(url, {
+
+      // Create Request for callbacks (needed for beforeRequest/afterResponse)
+      const request = new Request(url ?? requestUrl, {
         ...fetchOptions,
         dispatcher,
         method,
-        headers,
+        headers: headers ?? headerObj,
         body,
         signal,
       } as globalThis.RequestInit);
+
       if (beforeRequest) {
         const p = beforeRequest(request);
         if (p instanceof Promise) await p;
@@ -235,23 +376,17 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
           abortController.abort(REASON_TIMEOUT);
         });
       }
-      let response: globalThis.Response & {
+      let response: (globalThis.Response | UndiciResponseShim) & {
         request: globalThis.Request;
         arangojsHostUrl: string;
       };
       try {
         if (undiciRequest) {
-          // Convert Headers to plain object for undici.request
-          const headerObj: Record<string, string> = {};
-          for (const [key, value] of headers) {
-            headerObj[key] = value;
-          }
-
           const {
             statusCode,
             headers: resHeaders,
             body: resBody,
-          } = await undiciRequest(url.toString(), {
+          } = await undiciRequest(requestUrl, {
             method,
             headers: headerObj,
             body,
@@ -259,7 +394,6 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
             dispatcher,
           });
 
-          // Create Response-like shim
           response = createUndiciResponse(
             statusCode,
             resHeaders,
