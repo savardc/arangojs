@@ -19,6 +19,73 @@ const MIME_JSON = /\/(json|javascript)(\W|$)/;
 const LEADER_ENDPOINT_HEADER = "x-arango-endpoint";
 const REASON_TIMEOUT = "timeout";
 
+/**
+ * @internal
+ *
+ * Reference to undici.request for performance optimization.
+ * When set, this is used instead of fetch for better performance.
+ */
+let undiciRequest: typeof import("undici").request | undefined;
+
+/**
+ * @internal
+ *
+ * Creates a Response-like object from undici.request result.
+ * This shim implements only the properties/methods used by arangojs.
+ */
+function createUndiciResponse(
+  statusCode: number,
+  headers: Record<string, string | string[] | undefined>,
+  body: import("undici").Dispatcher.ResponseData["body"],
+  request: globalThis.Request,
+  arangojsHostUrl: string,
+): globalThis.Response & {
+  request: globalThis.Request;
+  arangojsHostUrl: string;
+} {
+  // Normalize headers to Headers object
+  const normalizedHeaders = new Headers();
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const v of value) normalizedHeaders.append(key, v);
+    } else {
+      normalizedHeaders.set(key, value);
+    }
+  }
+
+  return {
+    status: statusCode,
+    statusText:
+      STATUS_CODE_DEFAULT_MESSAGES[
+        statusCode as keyof typeof STATUS_CODE_DEFAULT_MESSAGES
+      ] || "",
+    headers: normalizedHeaders,
+    body: body as any,
+    bodyUsed: false,
+    ok: statusCode >= 200 && statusCode < 300,
+    redirected: false,
+    type: "default",
+    url: request.url,
+    // Body consumption methods (undici body has same interface)
+    json: () => body.json(),
+    text: () => body.text(),
+    blob: () => body.blob(),
+    arrayBuffer: () => body.arrayBuffer(),
+    bytes: () => body.bytes(),
+    formData: () => {
+      throw new Error("formData() not supported");
+    },
+    // clone() for error body parsing (line 837)
+    clone() {
+      return this;
+    }, // Safe: only called before body consumption
+    // Metadata
+    request,
+    arangojsHostUrl,
+  } as any;
+}
+
 //#region Host
 /**
  * @internal
@@ -97,6 +164,7 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       }
       fetch = undici.fetch;
       Request = undici.Request;
+      undiciRequest = undici.request;
       return new undici.Agent(agentOptions);
     };
   }
@@ -167,12 +235,44 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
           abortController.abort(REASON_TIMEOUT);
         });
       }
-      let response: globalThis.Response & { request: globalThis.Request };
+      let response: globalThis.Response & {
+        request: globalThis.Request;
+        arangojsHostUrl: string;
+      };
       try {
-        response = Object.assign(await fetch(request), {
-          request,
-          arangojsHostUrl,
-        });
+        if (undiciRequest) {
+          // Convert Headers to plain object for undici.request
+          const headerObj: Record<string, string> = {};
+          for (const [key, value] of headers) {
+            headerObj[key] = value;
+          }
+
+          const {
+            statusCode,
+            headers: resHeaders,
+            body: resBody,
+          } = await undiciRequest(url.toString(), {
+            method,
+            headers: headerObj,
+            body,
+            signal,
+            dispatcher,
+          });
+
+          // Create Response-like shim
+          response = createUndiciResponse(
+            statusCode,
+            resHeaders,
+            resBody,
+            request,
+            arangojsHostUrl,
+          );
+        } else {
+          response = Object.assign(await fetch(request), {
+            request,
+            arangojsHostUrl,
+          });
+        }
         if (fetchOptions?.redirect === "manual" && isRedirect(response)) {
           throw new errors.HttpError(response);
         }
