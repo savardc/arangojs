@@ -19,19 +19,16 @@ const MIME_JSON = /\/(json|javascript)(\W|$)/;
 const LEADER_ENDPOINT_HEADER = "x-arango-endpoint";
 const REASON_TIMEOUT = "timeout";
 
-/**
- * @internal
- *
- * Reference to undici.request for performance optimization.
- * When set, this is used instead of fetch for better performance.
- */
-let undiciRequest: typeof import("undici").request | undefined;
 
 /**
  * @internal
  *
  * Creates a Response-like object from undici.request result.
  * This shim implements only the properties/methods used by arangojs.
+ *
+ * Note: clone() returns a new shim sharing the same body. This works because
+ * we only ever consumes the body once - either on the clone (error path)
+ * or on the original (success path), never both.
  */
 function createUndiciResponse(
   statusCode: number,
@@ -52,7 +49,11 @@ function createUndiciResponse(
       normalizedHeaders.set(key, value);
     }
   }
-  return {
+
+  const createResponseShim = (): globalThis.Response & {
+    request: globalThis.Request;
+    arangojsHostUrl: string;
+  } => ({
     status: statusCode,
     statusText: "",
     headers: normalizedHeaders,
@@ -71,14 +72,16 @@ function createUndiciResponse(
       throw new Error("formData() not supported");
     },
     clone() {
-      return this;
+      return createResponseShim();
     },
     request,
     arangojsHostUrl,
   } as globalThis.Response & {
     request: globalThis.Request;
     arangojsHostUrl: string;
-  };
+  });
+
+  return createResponseShim();
 }
 
 //#region Host
@@ -103,7 +106,7 @@ type Host = {
       | "hostUrl"
       | "expectBinary"
       | "isBinary"
-    >,
+    >
   ) => Promise<globalThis.Response & { request: globalThis.Request }>;
   /**
    * @internal
@@ -124,6 +127,7 @@ type Host = {
 function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
   const baseUrl = new URL(arangojsHostUrl);
   let fetch = globalThis.fetch;
+  let undiciRequest: typeof import("undici").request | undefined;
   let createDispatcher: (() => Promise<any>) | undefined;
   let dispatcher: any;
   let socketPath: string | undefined;
@@ -199,8 +203,8 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
         headers.set(
           "authorization",
           `Basic ${btoa(
-            `${baseUrl.username || "root"}:${baseUrl.password || ""}`,
-          )}`,
+            `${baseUrl.username || "root"}:${baseUrl.password || ""}`
+          )}`
         );
       }
       const abortController = new AbortController();
@@ -371,7 +375,7 @@ const STATUS_CODE_DEFAULT_MESSAGES = {
 
 type KnownStatusCode = keyof typeof STATUS_CODE_DEFAULT_MESSAGES;
 const KNOWN_STATUS_CODES = Object.keys(STATUS_CODE_DEFAULT_MESSAGES).map((k) =>
-  Number(k),
+  Number(k)
 ) as KnownStatusCode[];
 const REDIRECT_CODES = [301, 302, 303, 307, 308] satisfies KnownStatusCode[];
 type RedirectStatusCode = (typeof REDIRECT_CODES)[number];
@@ -430,7 +434,7 @@ export type ArangoApiResponse<T> = T & ArangoResponseMetadata;
  * Indicates whether the given value represents an ArangoDB error response.
  */
 export function isArangoErrorResponse(
-  body: unknown,
+  body: unknown
 ): body is ArangoErrorResponse {
   if (!body || typeof body !== "object") return false;
   const obj = body as Record<string, unknown>;
@@ -673,7 +677,7 @@ export type CommonRequestOptions = {
    */
   afterResponse?: (
     err: errors.NetworkError | null,
-    res?: globalThis.Response & { request: globalThis.Request },
+    res?: globalThis.Response & { request: globalThis.Request }
   ) => void | Promise<void>;
 };
 
@@ -826,11 +830,11 @@ export class Connection {
 
     this._commonFetchOptions.headers.set(
       "x-arango-version",
-      String(arangoVersion),
+      String(arangoVersion)
     );
     this._commonFetchOptions.headers.set(
       "x-arango-driver",
-      `arangojs/${process.env.ARANGOJS_VERSION} (cloud)`,
+      `arangojs/${process.env.ARANGOJS_VERSION} (cloud)`
     );
 
     this.addToHostList(URLS);
@@ -1010,7 +1014,7 @@ export class Connection {
   setBasicAuth(auth: configuration.BasicAuthCredentials) {
     this.setHeader(
       "authorization",
-      `Basic ${btoa(`${auth.username}:${auth.password}`)}`,
+      `Basic ${btoa(`${auth.username}:${auth.password}`)}`
     );
   }
 
@@ -1044,7 +1048,7 @@ export class Connection {
    */
   database(
     databaseName: string,
-    database: databases.Database,
+    database: databases.Database
   ): databases.Database;
   /**
    * @internal
@@ -1058,7 +1062,7 @@ export class Connection {
   database(databaseName: string, database: null): undefined;
   database(
     databaseName: string,
-    database?: databases.Database | null,
+    database?: databases.Database | null
   ): databases.Database | undefined {
     if (database === null) {
       this._databases.delete(databaseName);
@@ -1089,7 +1093,7 @@ export class Connection {
         const i = this._hostUrls.indexOf(url);
         if (i !== -1) return this._hosts[i];
         return createHost(url, this._agentOptions);
-      }),
+      })
     );
     this._hostUrls.splice(0, this._hostUrls.length, ...cleanUrls);
   }
@@ -1105,15 +1109,13 @@ export class Connection {
    */
   addToHostList(urls: string | string[]): string[] {
     const cleanUrls = (Array.isArray(urls) ? urls : [urls]).map((url) =>
-      util.normalizeUrl(url),
+      util.normalizeUrl(url)
     );
     const newUrls = cleanUrls.filter(
-      (url) => this._hostUrls.indexOf(url) === -1,
+      (url) => this._hostUrls.indexOf(url) === -1
     );
     this._hostUrls.push(...newUrls);
-    this._hosts.push(
-      ...newUrls.map((url) => createHost(url, this._agentOptions)),
-    );
+    this._hosts.push(...newUrls.map((url) => createHost(url, this._agentOptions)));
     return cleanUrls;
   }
 
@@ -1231,8 +1233,8 @@ export class Connection {
       res: globalThis.Response & {
         request: globalThis.Request;
         parsedBody?: any;
-      },
-    ) => T,
+      }
+    ) => T
   ): Promise<T> {
     const {
       hostUrl,
@@ -1250,7 +1252,7 @@ export class Connection {
 
     const headers = util.mergeHeaders(
       this._commonFetchOptions.headers,
-      requestHeaders,
+      requestHeaders
     );
 
     let body = requestBody;
