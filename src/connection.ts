@@ -24,7 +24,7 @@ const REASON_TIMEOUT = "timeout";
  * @internal
  *
  * Creates a Response-like object from undici.request result.
- * This shim implements only the properties/methods used by arangojs.
+ * This shim implements only the properties/methods used internally.
  *
  * Note: clone() returns a new shim sharing the same body. This works because
  * we only ever consumes the body once - either on the clone (error path)
@@ -32,7 +32,7 @@ const REASON_TIMEOUT = "timeout";
  */
 function createUndiciResponse(
   statusCode: number,
-  headers: Record<string, string | string[] | undefined>,
+  headers: import("undici").Dispatcher.ResponseData["headers"],
   body: import("undici").Dispatcher.ResponseData["body"],
   request: globalThis.Request,
   arangojsHostUrl: string,
@@ -53,33 +53,34 @@ function createUndiciResponse(
   const createResponseShim = (): globalThis.Response & {
     request: globalThis.Request;
     arangojsHostUrl: string;
-  } => ({
-    status: statusCode,
-    statusText: "",
-    headers: normalizedHeaders,
-    body: body as unknown as ReadableStream<Uint8Array> | null,
-    bodyUsed: false,
-    ok: statusCode >= 200 && statusCode < 300,
-    redirected: false,
-    type: "default",
-    url: request.url,
-    json: () => body.json(),
-    text: () => body.text(),
-    blob: () => body.blob(),
-    arrayBuffer: () => body.arrayBuffer(),
-    bytes: () => body.bytes(),
-    formData: () => {
-      throw new Error("formData() not supported");
-    },
-    clone() {
-      return createResponseShim();
-    },
-    request,
-    arangojsHostUrl,
-  } as globalThis.Response & {
-    request: globalThis.Request;
-    arangojsHostUrl: string;
-  });
+  } =>
+    ({
+      status: statusCode,
+      statusText: "",
+      headers: normalizedHeaders,
+      body: body as unknown as ReadableStream<Uint8Array> | null,
+      bodyUsed: false,
+      ok: statusCode >= 200 && statusCode < 300,
+      redirected: false,
+      type: "default",
+      url: request.url,
+      json: () => body.json(),
+      text: () => body.text(),
+      blob: () => body.blob(),
+      arrayBuffer: () => body.arrayBuffer(),
+      bytes: () => body.bytes(),
+      formData: () => {
+        throw new Error("formData() not supported");
+      },
+      clone() {
+        return createResponseShim();
+      },
+      request,
+      arangojsHostUrl,
+    }) as globalThis.Response & {
+      request: globalThis.Request;
+      arangojsHostUrl: string;
+    };
 
   return createResponseShim();
 }
@@ -254,7 +255,7 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
           });
           response = createUndiciResponse(
             statusCode,
-            resHeaders as Record<string, string | string[] | undefined>,
+            resHeaders,
             resBody,
             request,
             arangojsHostUrl,
