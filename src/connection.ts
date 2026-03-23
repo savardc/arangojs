@@ -19,7 +19,6 @@ const MIME_JSON = /\/(json|javascript)(\W|$)/;
 const LEADER_ENDPOINT_HEADER = "x-arango-endpoint";
 const REASON_TIMEOUT = "timeout";
 
-
 /**
  * @internal
  *
@@ -27,7 +26,7 @@ const REASON_TIMEOUT = "timeout";
  * This shim implements only the properties/methods used internally.
  *
  * Note: clone() returns a new shim sharing the same body. This works because
- * we only ever consumes the body once - either on the clone (error path)
+ * we only ever consume the body once - either on the clone (error path)
  * or on the original (success path), never both.
  */
 function createUndiciResponse(
@@ -927,10 +926,10 @@ export class Connection {
       const contentType = res.headers.get("content-type");
       if (res.status >= 400) {
         if (contentType?.match(MIME_JSON)) {
-          const errorResponse = res.clone();
+          const bodyText = await res.text();
           let errorBody: any;
           try {
-            errorBody = await errorResponse.json();
+            errorBody = JSON.parse(bodyText);
           } catch {
             // noop
           }
