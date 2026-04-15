@@ -144,8 +144,17 @@ export type QueryOptions = {
   /**
    * Limits the maximum number of plans that will be created by the AQL query
    * optimizer.
+   *
+   * @deprecated Use `maxNumberOfPlans` instead. `maxPlans` will be removed in a
+   * future major version. Both are currently supported; when both are provided,
+   * `maxNumberOfPlans` takes precedence.
    */
   maxPlans?: number;
+  /**
+   * Limits the maximum number of plans that will be created by the AQL query
+   * optimizer.
+   */
+  maxNumberOfPlans?: number;
   /**
    * Controls after how many execution nodes in a query a stack split should be
    * performed.
@@ -276,6 +285,11 @@ export type QueryTrackingOptions = {
    * considered slow.
    */
   slowQueryThreshold?: number;
+  /**
+   * Threshold in seconds for treating a streaming query as slow
+   * (the `stream` option is `true` for the query).
+   */
+  slowStreamingQueryThreshold?: number;
   /**
    * If set to `true`, bind parameters will be tracked along with queries.
    */
@@ -504,6 +518,11 @@ export type QueryTrackingInfo = {
    */
   slowQueryThreshold: number;
   /**
+   * Threshold in seconds for treating a streaming query as slow
+   * (the `stream` option is `true` for the query).
+   */
+  slowStreamingQueryThreshold: number;
+  /**
    * Whether bind parameters are being tracked along with queries.
    */
   trackBindVars: boolean;
@@ -632,6 +651,15 @@ export type QueryDescription = {
    * Whether the query uses a streaming cursor.
    */
   stream: boolean;
+  /**
+   * Whether the query writes data (`true`) or only reads (`false`).
+   */
+  modificationQuery: boolean;
+  /**
+   * An error code (`errorNum`) that indicates why the query failed, or `0` on success.
+   * Only present in slow queries (finished queries), not in running queries.
+   */
+  exitCode?: number;
 };
 //#endregion
 

@@ -14,9 +14,20 @@ This driver uses semantic versioning:
 - A change in the major version (e.g. 1.Y.Z -> 2.0.0) indicates _breaking_
   changes that require changes in your code to upgrade.
 
-## [Unreleased]
+## [10.3.0] - 2026-04-14
 
 ### Added
+
+- Added missing AQL query tracking attributes to match HTTP API documentation (DE-1139)
+
+  The query tracking types now include all attributes supported by the ArangoDB query tracking endpoints:
+  - `slowStreamingQueryThreshold`: Added to `QueryTrackingOptions` (optional) and `QueryTrackingInfo` (required)
+    - Threshold in seconds for treating a streaming query as slow (when `stream` option is `true`)
+  - `modificationQuery`: Added to `QueryDescription` (required)
+    - Boolean indicating whether the query writes data (`true`) or only reads (`false`)
+  - `exitCode`: Added to `QueryDescription` (optional)
+    - Error code (`errorNum`) indicating why the query failed, or `0` on success
+    - Only present in slow queries (finished queries), not in running queries
 
 - Added missing options to `ExplainOptions` type for `Database.explain()` method (DE-1009)
 
@@ -27,8 +38,26 @@ This driver uses semantic versioning:
   - `maxWarningCount`: Limit the number of warnings returned
   - `failOnWarning`: Throw exception on warnings instead of returning them
 
-  These options were already accepted by the server but were not typed in the driver,
-  preventing TypeScript users from getting type checking and IntelliSense support.
+- Added `trainingState`, `errorMessage`, and `sparse` for vector indexes (DE-1147)
+
+  `VectorIndexDescription` now reflects ArangoDB 3.12.9+ index responses: optional
+  `trainingState` (`unusable`, `training`, `ingesting`, or `ready`) and optional
+  `errorMessage` when training or usability fails (for example, insufficient training data).
+   The `VectorIndexTrainingState` type alias documents the allowed
+  `trainingState` values.
+
+  `EnsureVectorIndexOptions` now includes optional `sparse`, aligned with the
+  vector index HTTP API so documents without the indexed vector field can be
+  omitted when `sparse` is `true`.
+
+### Fixed
+
+- Fixed incorrect handling of `maxPlans` in `QueryOptions`. The driver now
+  supports `maxNumberOfPlans` and maps legacy `maxPlans` to `maxNumberOfPlans` 
+  when the latter is not provided. The driver always sends `options.maxNumberOfPlans` 
+  to the server. If both are provided, `maxNumberOfPlans` takes precedence.
+  `maxPlans` is deprecated and will be removed in a future major release.
+  ([#845](https://github.com/arangodb/arangojs/issues/845))
 
 ## [10.2.2] - 2026-01-30
 
@@ -2575,6 +2604,7 @@ For a detailed list of changes between pre-release versions of v7 see the
 
   Graph methods now only return the relevant part of the response body.
 
+[10.3.0]: https://github.com/arangodb/arangojs/compare/v10.2.2...v10.3.0
 [10.2.2]: https://github.com/arangodb/arangojs/compare/v10.2.1...v10.2.2
 [10.2.1]: https://github.com/arangodb/arangojs/compare/v10.2.0...v10.2.1
 [10.2.0]: https://github.com/arangodb/arangojs/compare/v10.1.2...v10.2.0
