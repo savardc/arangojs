@@ -3,19 +3,32 @@ import { Database } from "../index.js";
 import { config } from "./_config.js";
 
 describe("agentOptions with undici", () => {
-  it("uses undici.Request with undici.fetch", async () => {
+  // Historically `agentOptions` routed through `undici.fetch`, which rejects a
+  // `globalThis.Request` with ERR_INVALID_URL ("[object Request]"). Requests
+  // now go through `undici.request` instead, so that specific failure mode is
+  // no longer reachable, but the request must still succeed end to end.
+  it("performs a request when agentOptions is set", async () => {
+    const url = Array.isArray(config.url) ? config.url[0] : config.url;
     const db = new Database({
-      url: "http://127.0.0.1:8529",
+      url,
       agentOptions: { keepAliveTimeout: 30000 },
     });
 
     try {
-      await db.version();
+      const version = await db.version();
+      expect(version).to.have.property("server");
+      expect(version).to.have.property("version");
     } catch (e: any) {
       const cause = e.cause?.cause;
-      if (cause?.code === "ERR_INVALID_URL" && cause?.input === "[object Request]") {
-        expect.fail("undici.fetch requires undici.Request, not globalThis.Request");
+      if (
+        cause?.code === "ERR_INVALID_URL" &&
+        cause?.input === "[object Request]"
+      ) {
+        expect.fail(
+          "undici rejected a globalThis.Request; an undici-native Request is required",
+        );
       }
+      throw e;
     } finally {
       db.close();
     }
