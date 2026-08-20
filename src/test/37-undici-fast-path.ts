@@ -15,8 +15,14 @@
  */
 import { expect } from "chai";
 import * as http from "node:http";
+import * as net from "node:net";
 import { getStatusMessage } from "../connection.js";
 import { Database } from "../databases.js";
+import {
+  NetworkError,
+  ResponseTimeoutError,
+  isArangoError,
+} from "../errors.js";
 
 type CapturedRequest = {
   method: string;
@@ -332,6 +338,115 @@ describe("undici fast path", function () {
         (e: any) => e.response,
       );
       expect(getStatusMessage(res)).to.equal("Not Found");
+    });
+  });
+
+  describe("errors raised before a response exists", () => {
+    /**
+     * When a request fails before any response is received the driver has no
+     * response object to take a request from, so it builds one for error
+     * reporting. These tests pin down that fallback: the reported URL has to
+     * describe the request that was actually attempted.
+     */
+
+    /** An address with nothing listening on it, to force a connection error. */
+    async function unusedUrl(): Promise<string> {
+      const probe = net.createServer();
+      await new Promise<void>((resolve) =>
+        probe.listen(0, "127.0.0.1", resolve),
+      );
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Failed to determine probe address");
+      }
+      const { port } = address;
+      await new Promise<void>((resolve, reject) =>
+        probe.close((err) => (err ? reject(err) : resolve())),
+      );
+      return `http://127.0.0.1:${port}`;
+    }
+
+    it("reports a NetworkError when the connection is refused", async () => {
+      const db = fastPathDb(await unusedUrl());
+      try {
+        await db.version();
+        expect.fail("expected the request to fail");
+      } catch (e: any) {
+        expect(isArangoError(e)).to.equal(false);
+        expect(e).to.be.instanceOf(NetworkError);
+      } finally {
+        db.close();
+      }
+    });
+
+    it("includes the attempted path in the error's request URL", async () => {
+      const base = await unusedUrl();
+      const db = fastPathDb(base);
+      try {
+        await db.request({ method: "GET", pathname: "/_api/version" }, false);
+        expect.fail("expected the request to fail");
+      } catch (e: any) {
+        expect(e).to.be.instanceOf(NetworkError);
+        // Regression guard: the fallback used to be built from the base URL
+        // and pathname alone, which could omit the separating slash.
+        expect(e.request.url).to.include("/_api/version");
+        expect(e.request.url).to.not.include("undefined");
+        expect(e.request.url.startsWith(base)).to.equal(true);
+      } finally {
+        db.close();
+      }
+    });
+
+    it("keeps the query string in the error's request URL", async () => {
+      const db = fastPathDb(await unusedUrl());
+      try {
+        await db.request(
+          {
+            method: "GET",
+            pathname: "/_api/version",
+            search: { details: "true" },
+          },
+          false,
+        );
+        expect.fail("expected the request to fail");
+      } catch (e: any) {
+        expect(e).to.be.instanceOf(NetworkError);
+        // Regression guard: the fallback previously dropped the query string
+        // entirely, so errors described a URL that was never requested.
+        expect(e.request.url).to.include("details=true");
+      } finally {
+        db.close();
+      }
+    });
+
+    it("reports a ResponseTimeoutError when the server never responds", async () => {
+      // A server that accepts the connection but never replies, so the
+      // failure happens after connecting but before any response arrives.
+      const silent = http.createServer(() => {
+        /* deliberately never responds */
+      });
+      await new Promise<void>((resolve) =>
+        silent.listen(0, "127.0.0.1", resolve),
+      );
+      const address = silent.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Failed to determine silent server address");
+      }
+      const db = fastPathDb(`http://127.0.0.1:${address.port}`);
+      try {
+        await db.request(
+          { method: "GET", pathname: "/_api/version", timeout: 300 },
+          false,
+        );
+        expect.fail("expected the request to time out");
+      } catch (e: any) {
+        expect(e).to.be.instanceOf(ResponseTimeoutError);
+        expect(e.request.url).to.include("/_api/version");
+      } finally {
+        db.close();
+        silent.closeAllConnections?.();
+        await new Promise<void>((resolve) => silent.close(() => resolve()));
+      }
     });
   });
 });
