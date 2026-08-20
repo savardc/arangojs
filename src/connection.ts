@@ -19,6 +19,158 @@ const MIME_JSON = /\/(json|javascript)(\W|$)/;
 const LEADER_ENDPOINT_HEADER = "x-arango-endpoint";
 const REASON_TIMEOUT = "timeout";
 
+/**
+ * @internal
+ *
+ * Minimal structural types for the parts of `undici.request` the driver uses.
+ * Declared locally rather than imported from `undici` so the source still
+ * type-checks when the optional `undici` peer dependency is not installed.
+ */
+type UndiciResponseHeaders = Record<string, string | string[] | undefined>;
+interface UndiciResponseBody {
+  json(): Promise<any>;
+  text(): Promise<string>;
+  blob(): Promise<Blob>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  bytes(): Promise<Uint8Array>;
+}
+type UndiciRequest = (
+  url: string,
+  options: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: any;
+    signal?: AbortSignal;
+    dispatcher?: any;
+  },
+) => Promise<{
+  statusCode: number;
+  headers: UndiciResponseHeaders;
+  body: UndiciResponseBody;
+}>;
+
+/**
+ * @internal
+ *
+ * Lightweight header accessor that wraps undici's raw header object.
+ * Avoids constructing a full Headers instance on every response.
+ * Only implements get() which is all the response processing needs.
+ */
+class UndiciHeadersAccessor {
+  private _raw: Record<string, string | string[] | undefined>;
+  private _headers: Headers | undefined;
+
+  constructor(raw: UndiciResponseHeaders) {
+    this._raw = raw;
+  }
+
+  get(name: string): string | null {
+    const value = this._raw[name.toLowerCase()];
+    if (value === undefined) return null;
+    if (Array.isArray(value)) return value.join(", ");
+    return value;
+  }
+
+  has(name: string): boolean {
+    return this._raw[name.toLowerCase()] !== undefined;
+  }
+
+  /** Lazily construct full Headers only when iteration is needed */
+  [Symbol.iterator](): IterableIterator<[string, string]> {
+    return this._getFullHeaders().entries();
+  }
+
+  entries(): IterableIterator<[string, string]> {
+    return this._getFullHeaders().entries();
+  }
+
+  private _getFullHeaders(): Headers {
+    if (!this._headers) {
+      this._headers = new Headers();
+      for (const [key, value] of Object.entries(this._raw)) {
+        if (value === undefined) continue;
+        if (Array.isArray(value)) {
+          for (const v of value) this._headers.append(key, v);
+        } else {
+          this._headers.set(key, value);
+        }
+      }
+    }
+    return this._headers;
+  }
+}
+
+/**
+ * @internal
+ *
+ * Creates a minimal Response-like object from undici.request result.
+ * Avoids constructing Headers and full Response objects on the hot path.
+ *
+ * Note: The request property is lazily created since it's only needed
+ * on error paths and when beforeRequest/afterResponse hooks are used.
+ */
+function createUndiciResponse(
+  statusCode: number,
+  headers: UndiciResponseHeaders,
+  body: UndiciResponseBody,
+  url: string,
+  arangojsHostUrl: string,
+  lazyRequest: () => globalThis.Request,
+): globalThis.Response & {
+  request: globalThis.Request;
+  arangojsHostUrl: string;
+} {
+  const headerAccessor = new UndiciHeadersAccessor(headers);
+  return {
+    status: statusCode,
+    // undici.request does not expose the HTTP reason phrase, so reconstruct
+    // it from the status code for known codes. This keeps getStatusMessage's
+    // statusText fallback meaningful for codes outside its own lookup table.
+    statusText: isKnownStatusCode(statusCode)
+      ? STATUS_CODE_DEFAULT_MESSAGES[statusCode]
+      : "",
+    headers: headerAccessor as unknown as Headers,
+    body: body as unknown as ReadableStream<Uint8Array> | null,
+    bodyUsed: false,
+    ok: statusCode >= 200 && statusCode < 300,
+    redirected: false,
+    type: "default" as globalThis.Response["type"],
+    url,
+    json: () => body.json(),
+    text: () => body.text(),
+    blob: () => body.blob(),
+    arrayBuffer: () => body.arrayBuffer(),
+    bytes: () => body.bytes(),
+    formData: () => {
+      throw new Error("formData() not supported");
+    },
+    clone() {
+      return createUndiciResponse(
+        statusCode,
+        headers,
+        body,
+        url,
+        arangojsHostUrl,
+        lazyRequest,
+      );
+    },
+    get request() {
+      return lazyRequest();
+    },
+    arangojsHostUrl,
+  } as unknown as globalThis.Response & {
+    request: globalThis.Request;
+    arangojsHostUrl: string;
+  };
+}
+
+/**
+ * @internal
+ *
+ * Monotonic request counter. Cheap alternative to generating random IDs.
+ */
+let _requestCounter = 0;
+
 //#region Host
 /**
  * @internal
@@ -62,6 +214,7 @@ type Host = {
 function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
   const baseUrl = new URL(arangojsHostUrl);
   let fetch = globalThis.fetch;
+  let undiciRequest: UndiciRequest | undefined;
   let createDispatcher: (() => Promise<any>) | undefined;
   let dispatcher: any;
   let socketPath: string | undefined;
@@ -97,10 +250,20 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       }
       fetch = undici.fetch;
       Request = undici.Request;
+      undiciRequest = undici.request;
       return new undici.Agent(agentOptions);
     };
   }
-  const pending = new Map<string, AbortController>();
+
+  // Pre-compute base URL parts and auth header for the undici fast path
+  // baseUrl.pathname includes the database prefix (e.g. "/_db/mydb/")
+  const basePrefix = baseUrl.origin + baseUrl.pathname.replace(/\/+$/, "");
+  const baseSearch = baseUrl.search;
+  const cachedAuthHeader = `Basic ${btoa(
+    `${baseUrl.username || "root"}:${baseUrl.password || ""}`
+  )}`;
+
+  const pending = new Map<number, AbortController>();
   return {
     async fetch({
       method,
@@ -121,44 +284,14 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
       | "expectBinary"
       | "isBinary"
     >) {
-      const url = new URL(pathname + baseUrl.search, baseUrl);
-      if (search) {
-        const searchParams =
-          search instanceof URLSearchParams
-            ? search
-            : new URLSearchParams(search);
-        for (const [key, value] of searchParams) {
-          url.searchParams.append(key, value);
-        }
-      }
-      const headers = new Headers(requestHeaders);
-      if (!headers.has("authorization")) {
-        headers.set(
-          "authorization",
-          `Basic ${btoa(
-            `${baseUrl.username || "root"}:${baseUrl.password || ""}`
-          )}`
-        );
-      }
       const abortController = new AbortController();
       const signal = abortController.signal;
       if (createDispatcher) {
         dispatcher = await createDispatcher();
         createDispatcher = undefined;
       }
-      const request = new Request(url, {
-        ...fetchOptions,
-        dispatcher,
-        method,
-        headers,
-        body,
-        signal,
-      } as globalThis.RequestInit);
-      if (beforeRequest) {
-        const p = beforeRequest(request);
-        if (p instanceof Promise) await p;
-      }
-      const requestId = util.generateRequestId();
+
+      const requestId = ++_requestCounter;
       pending.set(requestId, abortController);
       let clearTimer: (() => void) | undefined;
       if (timeout) {
@@ -167,34 +300,156 @@ function createHost(arangojsHostUrl: string, agentOptions?: any): Host {
           abortController.abort(REASON_TIMEOUT);
         });
       }
+
       let response: globalThis.Response & { request: globalThis.Request };
+      // Tracks the fully-built request URL so the catch block can report an
+      // accurate URL even when the failure occurs before `response` exists.
+      let requestUrl = basePrefix + (pathname?.startsWith("/") ? "" : "/") +
+        (pathname ?? "");
       try {
-        response = Object.assign(await fetch(request), {
-          request,
-          arangojsHostUrl,
-        });
+        if (undiciRequest) {
+          // Fast path: build URL as string, use plain header objects,
+          // defer Request construction to error/hook paths only
+          let urlStr = pathname?.startsWith("/")
+            ? basePrefix + pathname
+            : basePrefix + "/" + (pathname ?? "");
+          if (baseSearch) urlStr += baseSearch;
+          if (search) {
+            const searchParams =
+              search instanceof URLSearchParams
+                ? search
+                : new URLSearchParams(search);
+            const searchStr = searchParams.toString();
+            if (searchStr) {
+              urlStr += (urlStr.includes("?") ? "&" : "?") + searchStr;
+            }
+          }
+          requestUrl = urlStr;
+
+          // Convert Headers to plain object for undici.request. Keys are
+          // lowercased so the case-insensitive authorization check below
+          // matches regardless of how the caller cased the header.
+          const headerObj: Record<string, string> = {};
+          if (requestHeaders instanceof Headers) {
+            for (const [key, value] of requestHeaders) {
+              headerObj[key.toLowerCase()] = value;
+            }
+          } else if (requestHeaders) {
+            for (const [key, value] of Object.entries(requestHeaders)) {
+              headerObj[key.toLowerCase()] = Array.isArray(value)
+                ? value.join(", ")
+                : String(value);
+            }
+          }
+          if (!headerObj["authorization"]) {
+            headerObj["authorization"] = cachedAuthHeader;
+          }
+
+          // Lazy Request constructor — only called if hooks or errors need it
+          let _lazyRequest: globalThis.Request | undefined;
+          const lazyRequest = () => {
+            if (!_lazyRequest) {
+              _lazyRequest = new Request(urlStr, {
+                ...fetchOptions,
+                dispatcher,
+                method,
+                headers: headerObj,
+                body,
+                signal,
+              } as globalThis.RequestInit);
+            }
+            return _lazyRequest;
+          };
+
+          // Call beforeRequest hook if provided (needs Request object)
+          if (beforeRequest) {
+            const p = beforeRequest(lazyRequest());
+            if (p instanceof Promise) await p;
+          }
+
+          const {
+            statusCode,
+            headers: resHeaders,
+            body: resBody,
+          } = await undiciRequest(urlStr, {
+            method,
+            headers: headerObj,
+            body,
+            signal,
+            dispatcher,
+          });
+          response = createUndiciResponse(
+            statusCode,
+            resHeaders,
+            resBody,
+            urlStr,
+            arangojsHostUrl,
+            lazyRequest,
+          );
+        } else {
+          // Standard fetch path (browser, no agentOptions, etc.)
+          const url = new URL(pathname + baseUrl.search, baseUrl);
+          if (search) {
+            const searchParams =
+              search instanceof URLSearchParams
+                ? search
+                : new URLSearchParams(search);
+            for (const [key, value] of searchParams) {
+              url.searchParams.append(key, value);
+            }
+          }
+          const headers = new Headers(requestHeaders);
+          if (!headers.has("authorization")) {
+            headers.set("authorization", cachedAuthHeader);
+          }
+          const request = new Request(url, {
+            ...fetchOptions,
+            dispatcher,
+            method,
+            headers,
+            body,
+            signal,
+          } as globalThis.RequestInit);
+          if (beforeRequest) {
+            const p = beforeRequest(request);
+            if (p instanceof Promise) await p;
+          }
+          response = Object.assign(await fetch(request), {
+            request,
+            arangojsHostUrl,
+          });
+        }
         if (fetchOptions?.redirect === "manual" && isRedirect(response)) {
           throw new errors.HttpError(response);
         }
       } catch (e: unknown) {
         const cause = e instanceof Error ? e : new Error(String(e));
         let error: errors.NetworkError;
+        // Build a Request for error reporting (may already exist from lazy path)
+        const errorRequest =
+          (response! as any)?.request ?? new Request(requestUrl, { method });
         if (cause instanceof errors.NetworkError) {
           error = cause;
         } else if (signal.aborted) {
           const reason =
             typeof signal.reason == "string" ? signal.reason : undefined;
           if (reason === REASON_TIMEOUT) {
-            error = new errors.ResponseTimeoutError(undefined, request, {
+            error = new errors.ResponseTimeoutError(undefined, errorRequest, {
               cause,
             });
           } else {
-            error = new errors.RequestAbortedError(reason, request, { cause });
+            error = new errors.RequestAbortedError(reason, errorRequest, {
+              cause,
+            });
           }
         } else if (cause instanceof TypeError) {
-          error = new errors.FetchFailedError(undefined, request, { cause });
+          error = new errors.FetchFailedError(undefined, errorRequest, {
+            cause,
+          });
         } else {
-          error = new errors.NetworkError(cause.message, request, { cause });
+          error = new errors.NetworkError(cause.message, errorRequest, {
+            cause,
+          });
         }
         if (afterResponse) {
           const p = afterResponse(error);
@@ -381,6 +636,23 @@ export type ArangoErrorResponse = {
 
 /**
  * Processed response object.
+ *
+ * When the driver is configured with `agentOptions` (Node.js with the
+ * `undici` peer dependency), responses are served from a lightweight
+ * `undici.request`-backed object that implements only the subset of the
+ * `Response` interface the driver consumes. Consumers should rely only on
+ * the following members, which behave consistently across runtimes:
+ * `status`, `ok`, `url`, `headers.get()`, `headers.has()`, header
+ * iteration, `body`, and the body-reading methods (`json()`, `text()`,
+ * `blob()`, `arrayBuffer()`, `bytes()`), plus the driver additions below.
+ *
+ * The following diverge on the `undici` path and should not be relied upon:
+ * - `statusText` is reconstructed from the status code (the wire reason
+ *   phrase is not available) and is empty for unrecognized codes.
+ * - `formData()` is not supported and throws.
+ * - `headers` is a minimal accessor; methods beyond `get`/`has`/iteration
+ *   (e.g. `forEach`, `getSetCookie`) are not implemented.
+ * - `type` is always `"default"` and `redirected` is always `false`.
  */
 export interface ProcessedResponse<T = any> extends globalThis.Response {
   /**
@@ -841,10 +1113,10 @@ export class Connection {
       const contentType = res.headers.get("content-type");
       if (res.status >= 400) {
         if (contentType?.match(MIME_JSON)) {
-          const errorResponse = res.clone();
+          const bodyText = await res.text();
           let errorBody: any;
           try {
-            errorBody = await errorResponse.json();
+            errorBody = JSON.parse(bodyText);
           } catch {
             // noop
           }
@@ -855,7 +1127,7 @@ export class Connection {
         }
         throw new errors.HttpError(res);
       }
-      // Per RFC 7231, HEAD responses must not include a body 
+      // Per RFC 7231, HEAD responses must not include a body
       // Skip body parsing for non-error HEAD responses to ensure cross-runtime compatibility
       if (res.body && task.options.method !== "HEAD") {
         if (task.options.expectBinary) {
@@ -864,6 +1136,15 @@ export class Connection {
           res.parsedBody = await res.json();
         } else {
           res.parsedBody = await res.text();
+        }
+      } else if (task.options.method === "HEAD" && res.body) {
+        // Drain the body stream for HEAD responses to prevent resource leaks.
+        // undici's Readable has .dump(), fall back to .cancel() for standard ReadableStream.
+        const body = res.body as any;
+        if (typeof body.dump === "function") {
+          body.dump();
+        } else if (typeof body.cancel === "function") {
+          body.cancel();
         }
       }
       let result: any = res;
